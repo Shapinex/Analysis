@@ -5,6 +5,7 @@ FinBERT-basierte Sentiment-Analyse mit:
 - Titel + Summary Analyse (gewichtet 40/60)
 - Konfidenz-Gate (unsichere Ergebnisse → neutral)
 - Event-Klassifikation (Earnings, M&A, Macro, Analyst, etc.)
+- Dual-Mode: HuggingFace InferenceClient (Cloud) oder lokal
 """
 import logging
 import os
@@ -77,31 +78,49 @@ class TickerSentiment:
 class SentimentEngine:
     """
     Dual-Mode:
+    - mode="api": Nutzt HuggingFace InferenceClient (empfohlen für Cloud)
     - mode="local": Lädt FinBERT lokal (braucht ~1GB RAM + PyTorch)
-    - mode="api": Nutzt HuggingFace Inference API (kostenlos, kein lokales Modell)
     """
     TITLE_W = 0.4
     SUMMARY_W = 0.6
 
-    def __init__(self, mode: str = "auto"):
-        """
-        mode: "local", "api", oder "auto"
-        auto = versucht lokal, fällt auf API zurück
-        """
+    def __init__(self, mode: str = "api"):
         self.mode = mode
         self.pipe = None
+        self.client = None
+
+        # Token aus Streamlit Secrets oder Umgebungsvariable
         self.hf_token = os.getenv("HF_TOKEN", "")
 
-        if mode == "api" or (mode == "auto" and self.hf_token):
-            self._init_api()
-        elif mode == "local" or mode == "auto":
+        # Versuche auch Streamlit Secrets zu lesen
+        if not self.hf_token:
             try:
-                self._init_local()
-            except Exception as e:
-                logger.warning(f"Lokales Modell fehlgeschlagen: {e}. Versuche API...")
-                self._init_api()
+                import streamlit as st
+                self.hf_token = st.secrets.get("HF_TOKEN", "")
+            except Exception:
+                pass
+
+        if mode == "api":
+            self._init_api()
+        else:
+            self._init_local()
+
+    def _init_api(self):
+        """Initialisiert den HuggingFace InferenceClient."""
+        from huggingface_hub import InferenceClient
+
+        if not self.hf_token:
+            logger.warning("Kein HF_TOKEN gesetzt! Bitte in Streamlit Secrets eintragen.")
+
+        self.client = InferenceClient(
+            model=NLP_MODEL,
+            token=self.hf_token if self.hf_token else None,
+        )
+        self.mode = "api"
+        logger.info(f"HuggingFace InferenceClient initialisiert ({'mit' if self.hf_token else 'ohne'} Token)")
 
     def _init_local(self):
+        """Lädt FinBERT lokal mit transformers."""
         from transformers import pipeline as hf_pipeline
         logger.info(f"Lade {NLP_MODEL} lokal...")
         self.pipe = hf_pipeline(
@@ -111,40 +130,22 @@ class SentimentEngine:
         self.mode = "local"
         logger.info("Lokales Modell geladen.")
 
-    def _init_api(self):
-        self.mode = "api"
-        self.api_url = f"https://api-inference.huggingface.co/models/{NLP_MODEL}"
-        self.headers = {}
-        if self.hf_token:
-            self.headers["Authorization"] = f"Bearer {self.hf_token}"
-        logger.info(f"HuggingFace API Modus ({'mit' if self.hf_token else 'ohne'} Token)")
-
-    def _query_api(self, text: str) -> dict:
-        """Sendet Text an HuggingFace Inference API."""
-        import requests
+    def _query_api(self, text: str) -> List[dict]:
+        """Sendet Text an HuggingFace Inference API via InferenceClient."""
         for attempt in range(3):
             try:
-                resp = requests.post(
-                    self.api_url,
-                    headers=self.headers,
-                    json={"inputs": text[:NLP_MAX_LENGTH]},
-                    timeout=30,
-                )
-                if resp.status_code == 503:
-                    # Modell wird geladen
-                    wait = resp.json().get("estimated_time", 20)
-                    logger.info(f"API: Modell lädt, warte {wait:.0f}s...")
-                    time.sleep(min(wait, 30))
-                    continue
-                resp.raise_for_status()
-                data = resp.json()
-                if isinstance(data, list) and len(data) > 0:
-                    # API gibt [[{label, score}, ...]] zurück
-                    return data[0] if isinstance(data[0], list) else data
-                return [{"label": "neutral", "score": 0.5}]
+                result = self.client.text_classification(text[:NLP_MAX_LENGTH])
+                # result ist eine Liste von ClassificationOutput Objekten
+                return [{"label": r.label, "score": r.score} for r in result]
             except Exception as e:
+                error_str = str(e)
+                if "loading" in error_str.lower() or "503" in error_str:
+                    logger.info(f"API: Modell wird geladen, warte 20s... (Versuch {attempt+1})")
+                    time.sleep(20)
+                    continue
                 logger.warning(f"API Fehler (Versuch {attempt+1}): {e}")
-                time.sleep(2)
+                time.sleep(3)
+
         return [{"label": "neutral", "score": 0.5}]
 
     def _classify_events(self, text: str) -> List[str]:
@@ -165,7 +166,6 @@ class SentimentEngine:
             conf = res["score"]
         else:
             results = self._query_api(text)
-            # Finde das Label mit höchstem Score
             best = max(results, key=lambda x: x["score"])
             label = best["label"]
             conf = best["score"]
@@ -182,7 +182,6 @@ class SentimentEngine:
     def analyze_article(self, article: Article) -> SentimentResult:
         t_label, t_score, t_conf = self._analyze_text(article.title)
 
-        # Summary nur wenn vorhanden und unterschiedlich
         if article.summary and article.summary != article.title:
             s_label, s_score, s_conf = self._analyze_text(article.summary)
             combined_score = t_score * self.TITLE_W + s_score * self.SUMMARY_W
@@ -219,7 +218,6 @@ class SentimentEngine:
                 weight=INDEX.get_weight(ticker),
             )
 
-        # Konfidenz-gewichteter Durchschnitt
         total_conf = sum(r.confidence for r in results)
         if total_conf > 0:
             avg_score = sum(r.score * r.confidence for r in results) / total_conf
@@ -231,7 +229,6 @@ class SentimentEngine:
         neg = sum(1 for r in results if r.label == "negative")
         neu = sum(1 for r in results if r.label == "neutral")
 
-        # Top Events
         ev_counts: Dict[str, int] = {}
         for r in results:
             for e in r.events:
