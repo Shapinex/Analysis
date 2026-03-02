@@ -2,6 +2,7 @@
 EUSTX50 Sentiment Engine – Dashboard
 =====================================
 5 Tabs: Markt-Übersicht | Einzelwerte | News-Feed | Divergenz-Radar | Historie
+Powered by Groq LPU + Llama 3.3 70B
 """
 import warnings
 warnings.filterwarnings("ignore")
@@ -35,23 +36,6 @@ st.set_page_config(
 with st.sidebar:
     st.title("⚙️ Einstellungen")
 
-    st.subheader("🧠 NLP-Modus")
-    nlp_mode = st.radio(
-        "FinBERT Ausführung:",
-        ["api", "local"],
-        format_func=lambda x: "☁️ HuggingFace API (empfohlen für Cloud)" if x == "api"
-                               else "💻 Lokal (braucht ~1GB RAM + PyTorch)",
-        index=0,
-        help="API = kostenlos, kein lokales Modell. Lokal = schneller, braucht mehr RAM.",
-    )
-    hf_token = st.text_input(
-        "HuggingFace Token (optional)", type="password",
-        help="Erhöht API-Rate-Limit. Kostenlos: huggingface.co/settings/tokens",
-    )
-    if hf_token:
-        import os
-        os.environ["HF_TOKEN"] = hf_token
-
     st.subheader("📊 Parameter")
     lookback = st.slider("Tage zurückschauen", 1, 14, NEWS_LOOKBACK_DAYS)
     min_art = st.slider("Min. Artikel für Signal", 1, 10, 3)
@@ -61,13 +45,14 @@ with st.sidebar:
     store = SentimentStore()
     scan_count = store.get_scan_count()
     st.caption(f"📦 {scan_count} Scans in der Datenbank")
-    st.caption("EUSTX50 Sentiment Engine v2.0")
+    st.caption("⚡ Powered by Groq LPU + Llama 3.3 70B")
+    st.caption("EUSTX50 Sentiment Engine v2.1")
     st.caption("⚠️ Keine Anlageberatung.")
 
 
 # ─── Header ─────────────────────────────────────────────────────────────────
 st.title("📊 EUSTX50 Sentiment Engine")
-st.caption("Gewichtete Multi-Source NLP-Analyse des Euro Stoxx 50 · FinBERT · Konfidenz-basiert")
+st.caption("Gewichtete Multi-Source NLP-Analyse des Euro Stoxx 50 · Groq LPU · Llama 3.3 70B")
 
 
 # ─── Session State ──────────────────────────────────────────────────────────
@@ -81,7 +66,13 @@ if "scan_done" not in st.session_state:
 def run_scan():
     sources = [YahooFinanceSource()]
     aggregator = NewsAggregator(sources)
-    engine = SentimentEngine(mode=nlp_mode)
+
+    try:
+        engine = SentimentEngine()
+    except ValueError as e:
+        st.error(f"❌ {e}")
+        st.info("Bitte GROQ_API_KEY in den Streamlit Secrets eintragen (Settings → Secrets)")
+        st.stop()
 
     progress = st.progress(0, text="Initialisiere...")
     ticker_sentiments = []
@@ -127,7 +118,7 @@ if not st.session_state.scan_done:
             run_scan()
             st.rerun()
     with c2:
-        st.info("Analysiert alle 50 EUSTX50-Aktien. Dauer: ca. 2–4 Minuten.")
+        st.info("⚡ Groq-powered Analyse aller 50 EUSTX50-Aktien. Dauer: ca. 1–2 Minuten.")
 
     # Zeige vergangene Scans als Vorschau
     history = store.get_index_history(days=30)
@@ -295,7 +286,7 @@ with tab2:
 
     st.divider()
 
-    # Bubble Chart: Score × Buzz × Konfidenz
+    # Bubble Chart
     st.subheader("Bubble Chart: Score × Buzz × Konfidenz")
     if not df_active.empty:
         fig_b = px.scatter(
@@ -312,7 +303,7 @@ with tab2:
         )
         st.plotly_chart(fig_b, use_container_width=True)
 
-    # Vollständige Tabelle
+    # Tabelle
     st.subheader("Alle Aktien (sortierbar)")
     st.dataframe(
         df_active.sort_values("Score", ascending=False)
@@ -326,17 +317,14 @@ with tab2:
 with tab3:
     st.subheader("Einzelartikel mit Sentiment-Bewertung")
 
-    # Ticker-Filter
     ticker_options = ["Alle"] + df_active["Ticker"].tolist()
     selected = st.selectbox("Ticker filtern:", ticker_options)
 
-    # Label-Filter
     label_filter = st.multiselect(
         "Sentiment filtern:", ["positive", "negative", "neutral"],
         default=["positive", "negative", "neutral"],
     )
 
-    # Alle Einzelergebnisse sammeln
     all_results = []
     for ts in sentiments:
         if selected != "Alle" and ts.ticker != selected:
@@ -346,10 +334,9 @@ with tab3:
                 all_results.append(r)
 
     all_results.sort(key=lambda r: r.article.published, reverse=True)
-
     st.caption(f"{len(all_results)} Artikel angezeigt")
 
-    for r in all_results[:100]:  # Max 100 anzeigen
+    for r in all_results[:100]:
         color_map = {"positive": "🟢", "negative": "🔴", "neutral": "⚪"}
         icon = color_map.get(r.label, "⚪")
         events_str = f" · 🏷️ {', '.join(r.events)}" if r.events else ""
@@ -371,10 +358,9 @@ with tab4:
     st.subheader("Preis vs. Stimmung – Divergenz-Check")
     st.write(
         "Vergleicht den 1-Monats-Kurs-Trend mit dem aktuellen Sentiment. "
-        "Divergenzen (z.B. steigende Kurse bei negativem Sentiment) können Warnsignale sein."
+        "Divergenzen können Warnsignale oder Chancen sein."
     )
 
-    # Kursdaten für alle aktiven Ticker holen
     @st.cache_data(ttl=3600, show_spinner="Lade Kursdaten...")
     def get_price_changes(tickers):
         changes = {}
@@ -395,7 +381,6 @@ with tab4:
         df_div["Kurs_1M_%"] = df_div["Ticker"].map(price_changes)
         df_div = df_div.dropna(subset=["Kurs_1M_%"])
 
-        # Divergenz-Erkennung
         df_div["Divergenz"] = "Kein Signal"
         df_div.loc[
             (df_div["Score"] > 0.1) & (df_div["Kurs_1M_%"] < -3), "Divergenz"
@@ -410,7 +395,6 @@ with tab4:
             (df_div["Score"] < -0.1) & (df_div["Kurs_1M_%"] < -3), "Divergenz"
         ] = "✅ Bestätigt bärisch"
 
-        # Scatter Plot
         fig_div = px.scatter(
             df_div, x="Score", y="Kurs_1M_%",
             color="Divergenz", hover_name="Ticker",
@@ -434,7 +418,6 @@ with tab4:
         )
         st.plotly_chart(fig_div, use_container_width=True)
 
-        # Divergenz-Tabelle
         divs = df_div[df_div["Divergenz"].str.startswith("⚡")]
         if not divs.empty:
             st.subheader("⚡ Divergenzen gefunden")
@@ -447,7 +430,7 @@ with tab4:
         else:
             st.info("Keine starken Divergenzen erkannt.")
 
-        # Deep Dive für einzelne Aktie
+        # Deep Dive
         st.divider()
         st.subheader("🔍 Einzelaktie Deep Dive")
         pick = st.selectbox("Aktie auswählen:", df_active["Ticker"].tolist(), key="deep")
@@ -513,7 +496,6 @@ with tab5:
         )
         st.plotly_chart(fig_hist, use_container_width=True)
 
-        # Ticker-spezifische Historie
         st.divider()
         st.subheader("Ticker-Historie")
         pick_t = st.selectbox("Ticker:", df_active["Ticker"].tolist(), key="hist_ticker")
@@ -532,6 +514,5 @@ with tab5:
     else:
         st.info(
             "Noch keine historischen Daten vorhanden. "
-            "Nach dem ersten Scan erscheint hier der Trend. "
-            "Führe regelmäßig Scans durch, um den Zeitverlauf zu sehen!"
+            "Nach dem ersten Scan erscheint hier der Trend."
         )
