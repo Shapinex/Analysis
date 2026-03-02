@@ -306,9 +306,7 @@ with tab2:
     # Tabelle
     st.subheader("Alle Aktien (sortierbar)")
     st.dataframe(
-        df_active.sort_values("Score", ascending=False)
-        .style.background_gradient(subset=["Score"], cmap="RdYlGn", vmin=-0.5, vmax=0.5)
-        .format({"Score": "{:+.3f}", "Konfidenz": "{:.0%}", "Gewicht": "{:.3f}"}),
+        df_active.sort_values("Score", ascending=False).reset_index(drop=True),
         use_container_width=True, height=500,
     )
 
