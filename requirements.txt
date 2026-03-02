@@ -4,4 +4,4 @@ plotly>=5.18.0
 pandas>=2.1.0
 numpy>=1.25.0
 requests>=2.31.0
-huggingface_hub>=0.25.0
+groq>=0.12.0
